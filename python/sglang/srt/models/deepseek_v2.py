@@ -528,6 +528,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
+            rope_range=(self.kv_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim),
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
@@ -539,6 +544,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            orig_context_len=getattr(
+                config, "orig_context_len", max_position_embeddings
+            ),
+            rope=self.rotary_emb,
+            rope_range=(self.qk_nope_head_dim, self.qk_head_dim),
             quant_config=quant_config,
             prefix=add_prefix("attn_mha", prefix),
         )
@@ -677,7 +687,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         k_nope = kv[..., : self.qk_nope_head_dim]
         v = kv[..., self.qk_nope_head_dim :]
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
         k[..., : self.qk_nope_head_dim] = k_nope
@@ -751,21 +768,24 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        v_input = latent_cache[..., : self.kv_lora_rank]
+        v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
+        k_input = latent_cache.unsqueeze(1)
+        k_input[..., : self.kv_lora_rank] = v_input
+        k_pe = k_input[..., self.kv_lora_rank :]
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        # RoPE is applied inside the attention kernel in HiP Attention
+        if not (
+            forward_batch.hip_metadata_cache_pool is not None
+            and forward_batch.hip_metadata_cache_pool.hip_config.using_extend
+        ):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        k = torch.cat([k_nope, k_pe], dim=-1)
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
 
-        if self.attention_backend == "fa3":
-            attn_output = self.attn_mqa(
-                q_nope_out, k, k_nope, forward_batch, q_rope=q_pe
-            )
-        else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
+        attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
         if self.use_deep_gemm_bmm:
@@ -817,6 +837,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        if forward_batch.hip_metadata_cache_pool is not None:
+            raise ValueError("HiP Attention does not support fused MLA with RoPE")
         enable_rope_fusion = (
             os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
         )
@@ -1414,12 +1436,18 @@ class DeepseekV2Model(nn.Module):
             hidden_states = input_embeds
 
         residual = None
+
+        forward_batch.on_model_start()
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
+            forward_batch.on_layer_start(i)
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
+            forward_batch.on_layer_end(i)
+        forward_batch.on_model_end()
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1429,6 +1457,7 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
+    hip_attention_supported = True
 
     def __init__(
         self,

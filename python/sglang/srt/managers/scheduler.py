@@ -1280,6 +1280,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         new_batch.prepare_for_extend()
 
@@ -1533,6 +1534,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             self.server_args.enable_custom_logit_processor,
+            self.server_args.hip_attention_config,
         )
         idle_batch.prepare_for_idle()
         return idle_batch
