@@ -1,5 +1,11 @@
+<<<<<<< HEAD
 ARG CUDA_VERSION=12.6.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
+=======
+ARG CUDA_VERSION=12.4.1
+
+FROM nvcr.io/nvidia/tritonserver:24.12-py3-min
+>>>>>>> eba42fe0b3139f85598f3f1fc7faa8e34a084ef1
 
 ARG BUILD_TYPE=all
 ARG DEEPEP_COMMIT=b6ce310bb0b75079682d09bc2ebc063a074fbd58
